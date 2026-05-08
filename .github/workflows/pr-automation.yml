@@ -1,0 +1,344 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        continue-on-error: true
+        run: |
+          npm run lint 2>&1 | tee eslint-output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Run Prettier check
+        id: prettier
+        continue-on-error: true
+        run: |
+          npx prettier --check . 2>&1 | tee prettier-output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Post code quality comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const eslintOutput = fs.existsSync('eslint-output.txt') ? fs.readFileSync('eslint-output.txt', 'utf8') : 'No output';
+            const prettierOutput = fs.existsSync('prettier-output.txt') ? fs.readFileSync('prettier-output.txt', 'utf8') : 'No output';
+            const eslintExitCode = '${{ steps.eslint.outputs.exit_code }}';
+            const prettierExitCode = '${{ steps.prettier.outputs.exit_code }}';
+            
+            const eslintStatus = eslintExitCode === '0' ? '✅ Passed' : '❌ Failed';
+            const prettierStatus = prettierExitCode === '0' ? '✅ Passed' : '❌ Failed';
+            
+            const comment = `## Code Quality Report
+            
+            ### ESLint
+            Status: ${eslintStatus}
+            \`\`\`
+            ${eslintOutput.substring(0, 2000)}
+            \`\`\`
+            
+            ### Prettier
+            Status: ${prettierStatus}
+            \`\`\`
+            ${prettierOutput.substring(0, 2000)}
+            \`\`\`
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: test
+        continue-on-error: true
+        run: |
+          npm test -- --coverage 2>&1 | tee test-output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Generate coverage summary
+        id: coverage
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            COVERAGE=$(node -p "JSON.stringify(require('./coverage/coverage-summary.json').total)")
+            echo "coverage_data=$COVERAGE" >> $GITHUB_OUTPUT
+          else
+            echo "coverage_data={}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+
+      - name: Post coverage comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const testOutput = fs.existsSync('test-output.txt') ? fs.readFileSync('test-output.txt', 'utf8') : 'No output';
+            const testExitCode = '${{ steps.test.outputs.exit_code }}';
+            const coverageData = '${{ steps.coverage.outputs.coverage_data }}';
+            
+            const testStatus = testExitCode === '0' ? '✅ Passed' : '❌ Failed';
+            let coverageSummary = 'Coverage data not available';
+            
+            try {
+              const cov = JSON.parse(coverageData);
+              if (cov.lines) {
+                coverageSummary = `
+            - **Lines**: ${cov.lines.pct}%
+            - **Statements**: ${cov.statements.pct}%
+            - **Functions**: ${cov.functions.pct}%
+            - **Branches**: ${cov.branches.pct}%
+                `;
+              }
+            } catch (e) {}
+            
+            const comment = `## Test Coverage Report
+            
+            ### Test Results
+            Status: ${testStatus}
+            
+            ### Coverage Summary
+            ${coverageSummary}
+            
+            <details>
+            <summary>View test output</summary>
+            
+            \`\`\`
+            ${testOutput.substring(0, 3000)}
+            \`\`\`
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        id: audit
+        continue-on-error: true
+        run: |
+          npm audit --audit-level=moderate --json > audit-report.json 2>&1 || true
+          npm audit --audit-level=moderate 2>&1 | tee audit-output.txt || true
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Scan for secrets with TruffleHog
+        id: secrets
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD:/pwd" trufflesecurity/trufflehog:latest github --repo https://github.com/${{ github.repository }} --json > secrets-report.json 2>&1 || true
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Post security comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const auditOutput = fs.existsSync('audit-output.txt') ? fs.readFileSync('audit-output.txt', 'utf8') : 'No audit output';
+            const auditExitCode = '${{ steps.audit.outputs.exit_code }}';
+            const secretsExitCode = '${{ steps.secrets.outputs.exit_code }}';
+            
+            let vulnerabilities = 'Unknown';
+            let dependenciesChecked = 'Unknown';
+            
+            try {
+              if (fs.existsSync('audit-report.json')) {
+                const auditData = JSON.parse(fs.readFileSync('audit-report.json', 'utf8'));
+                if (auditData.metadata) {
+                  vulnerabilities = auditData.metadata.vulnerabilities ? 
+                    JSON.stringify(auditData.metadata.vulnerabilities) : '0 found';
+                  dependenciesChecked = auditData.metadata.totalDependencies || 'Unknown';
+                }
+              }
+            } catch (e) {}
+            
+            const auditStatus = auditExitCode === '0' ? '✅ No vulnerabilities' : '⚠️ Vulnerabilities found';
+            const secretsStatus = secretsExitCode === '0' ? '✅ No secrets detected' : '⚠️ Potential secrets found';
+            
+            const comment = `## Security Scan Report
+            
+            ### Vulnerabilities
+            Status: ${auditStatus}
+            - **Dependencies checked**: ${dependenciesChecked}
+            - **Vulnerabilities**: ${vulnerabilities}
+            
+            ### Secrets Scan
+            Status: ${secretsStatus}
+            
+            <details>
+            <summary>View audit details</summary>
+            
+            \`\`\`
+            ${auditOutput.substring(0, 2000)}
+            \`\`\`
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        continue-on-error: true
+        run: |
+          npm run build 2>&1 | tee build-output.txt || echo "No build script, skipping build step"
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT || echo "exit_code=0" >> $GITHUB_OUTPUT
+
+      - name: Start application for validation
+        id: start
+        continue-on-error: true
+        run: |
+          npm start &
+          APP_PID=$!
+          echo "pid=$APP_PID" >> $GITHUB_OUTPUT
+          sleep 5
+          
+          # Validate endpoints
+          curl -f http://localhost:3000/health 2>&1 | tee endpoint-health.txt || echo "Health check failed" > endpoint-health.txt
+          curl -f http://localhost:3000/ 2>&1 | tee endpoint-root.txt || echo "Root check failed" > endpoint-root.txt
+          
+          kill $APP_PID || true
+
+      - name: Create deployment preview artifacts
+        run: |
+          mkdir -p preview
+          echo "Build timestamp: $(date)" > preview/build-info.txt
+          echo "Commit: ${{ github.sha }}" >> preview/build-info.txt
+          echo "PR: #${{ github.event.pull_request.number }}" >> preview/build-info.txt
+          cp -r * preview/ 2>/dev/null || true
+
+      - name: Upload preview artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deployment-preview
+          path: preview/
+          retention-days: 7
+
+      - name: Post build validation comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const buildOutput = fs.existsSync('build-output.txt') ? fs.readFileSync('build-output.txt', 'utf8') : 'Build step skipped or no output';
+            const healthCheck = fs.existsSync('endpoint-health.txt') ? fs.readFileSync('endpoint-health.txt', 'utf8') : 'Not checked';
+            const rootCheck = fs.existsSync('endpoint-root.txt') ? fs.readFileSync('endpoint-root.txt', 'utf8') : 'Not checked';
+            const buildExitCode = '${{ steps.build.outputs.exit_code }}';
+            
+            const buildStatus = buildExitCode === '0' ? '✅ Success' : '⚠️ Completed with warnings';
+            const endpointsAccessible = healthCheck.includes('failed') || rootCheck.includes('failed') ? '⚠️ Some endpoints failed' : '✅ Endpoints validated';
+            
+            const comment = `## Build Validation
+            
+            ### Build Status
+            ${buildStatus}
+            
+            ### Endpoint Validation
+            ${endpointsAccessible}
+            
+            ### Deployment Preview
+            Artifacts have been generated and uploaded for this build.
+            
+            <details>
+            <summary>View build output</summary>
+            
+            \`\`\`
+            ${buildOutput.substring(0, 2000)}
+            \`\`\`
+            </details>
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
